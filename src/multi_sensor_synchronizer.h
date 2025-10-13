@@ -5,6 +5,7 @@
 #include "sensor_data.h"
 #include "theta_camera.h"
 #include "equirect_to_fisheye.h"
+#include "logitech_camera.h"
 
 class MultiSensorSynchronizer {
 private:
@@ -14,6 +15,7 @@ private:
     std::deque<TimestampedFrame> realsense_buffer;
     std::deque<ThetaFrame> theta_buffer[MAX_THETA_CAMERAS];
     std::deque<LidarFrame> lidar_buffer;
+    std::deque<LogitechFrame> logitech_buffer;
     
     // Thread synchronization
     std::mutex realsense_mutex;
@@ -44,6 +46,7 @@ private:
     std::thread sync_thread;
     std::thread realsense_thread_handle;
     std::thread lidar_thread_handle;
+    std::thread logitech_thread_handle;
 
     // Private methods
     double get_current_time();
@@ -54,17 +57,24 @@ private:
     void remove_processed_frames(const LidarFrame& lidar_frame,
                                const TimestampedFrame* realsense_frame,
                                const ThetaFrame* theta0_frame,
-                               const ThetaFrame* theta1_frame);
+                                                             const ThetaFrame* theta1_frame,
+                                                             const LogitechFrame* logitech_frame);
     void save_synchronized_set(const LidarFrame& lidar_frame,
                              const TimestampedFrame* realsense_frame,
                              const ThetaFrame* theta0_frame,
                              const ThetaFrame* theta1_frame,
-                             double rs_diff, double theta0_diff, double theta1_diff);
+                             const LogitechFrame* logitech_frame,
+                             double rs_diff, double theta0_diff, double theta1_diff, double logitech_diff);
     
     // Thread functions
     void realsense_thread();
     void theta_collection_thread();
     void lidar_thread();
+    void logitech_thread();
+
+    // Logitech camera
+    LogitechCamera logitech_camera;
+    bool initialize_logitech_camera(const std::string& device = "/dev/video8", int w = 3840, int h = 2160);
 
 public:
     MultiSensorSynchronizer(const std::string& base_name = "multi_sensor_data");

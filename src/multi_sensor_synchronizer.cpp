@@ -19,12 +19,13 @@ MultiSensorSynchronizer::MultiSensorSynchronizer(const std::string& base_name) {
     std::filesystem::create_directories(base_dir + "/theta_cam0");
     std::filesystem::create_directories(base_dir + "/theta_cam1");
     std::filesystem::create_directories(base_dir + "/lidar_data");
+    std::filesystem::create_directories(base_dir + "/logitech_camera");
     
     // Initialize CSV files
     sync_csv.open(base_dir + "/synchronized_data.csv");
-    sync_csv << "sync_id,lidar_timestamp,realsense_timestamp,theta0_timestamp,theta1_timestamp,"
-             << "lidar_realsense_diff_ms,lidar_theta0_diff_ms,lidar_theta1_diff_ms,"
-             << "realsense_color,realsense_depth,theta0_image,theta1_image,num_points,has_imu\n";
+    sync_csv << "sync_id,lidar_timestamp,realsense_timestamp,theta0_timestamp,theta1_timestamp,logitech_timestamp,"
+             << "lidar_realsense_diff_ms,lidar_theta0_diff_ms,lidar_theta1_diff_ms,lidar_logitech_diff_ms,"
+             << "realsense_color,realsense_depth,theta0_image,theta1_image,num_points,has_imu, logitech_image\n";
     
     lidar_pointcloud_csv.open(base_dir + "/lidar_data/pointcloud_sync.csv");
     lidar_pointcloud_csv << "sync_id,timestamp,point_index,x,y,z,intensity,time,ring\n";
@@ -42,6 +43,15 @@ MultiSensorSynchronizer::MultiSensorSynchronizer(const std::string& base_name) {
     }
     
     std::cout << "Recording to directory: " << base_dir << std::endl;
+}
+
+bool MultiSensorSynchronizer::initialize_logitech_camera(const std::string& device, int w, int h) {
+    if (logitech_camera.is_initialized()) return true;
+    bool ok = logitech_camera.initialize(device, w, h);
+    if (!ok) {
+        std::cerr << "Warning: Failed to initialize Logitech camera at " << device << std::endl;
+    }
+    return ok;
 }
 
 MultiSensorSynchronizer::~MultiSensorSynchronizer() {
@@ -240,6 +250,51 @@ void MultiSensorSynchronizer::theta_collection_thread() {
     std::cout << "THETA collection thread stopped" << std::endl;
 }
 
+void MultiSensorSynchronizer::logitech_thread() {
+    std::cout << "Logitech capture thread started" << std::endl;
+
+    // Attempt to initialize with default device; if it fails, try once and then periodically
+    if (!logitech_camera.is_initialized()) {
+        initialize_logitech_camera();
+    }
+
+    while (!shutdown) {
+        try {
+            if (!logitech_camera.is_initialized()) {
+                // Try to initialize periodically
+                initialize_logitech_camera();
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+
+            cv::Mat frame;
+            if (logitech_camera.capture_frame(frame) && !frame.empty()) {
+                LogitechFrame lf(get_current_time(), frame);
+                {
+                    std::lock_guard<std::mutex> lock(lidar_mutex); // reuse existing mutex? create separate? use lidar_mutex to protect minimal code
+                }
+                {
+                    // push to dedicated buffer mutex would be ideal; reuse realsense_mutex for simplicity
+                    std::lock_guard<std::mutex> lock(realsense_mutex);
+                    logitech_buffer.push_back(std::move(lf));
+                }
+            } else {
+                // Sleep briefly to avoid busy loop when camera not producing
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        } catch (const std::exception& e) {
+            if (!shutdown) {
+                std::cout << "Logitech thread error: " << e.what() << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+    // Cleanup camera on exit
+    logitech_camera.cleanup();
+    std::cout << "Logitech capture thread stopped" << std::endl;
+}
+
 void MultiSensorSynchronizer::lidar_thread() {
     UnitreeLidarReader* lidar = nullptr;
     
@@ -355,6 +410,7 @@ bool MultiSensorSynchronizer::synchronization_callback() {
     std::vector<LidarFrame> lidar_frames;
     std::vector<TimestampedFrame> realsense_frames;
     std::vector<ThetaFrame> theta0_frames, theta1_frames;
+    std::vector<LogitechFrame> logitech_frames;
     
     {
         std::lock_guard<std::mutex> lock(lidar_mutex);
@@ -364,6 +420,11 @@ bool MultiSensorSynchronizer::synchronization_callback() {
     {
         std::lock_guard<std::mutex> lock(realsense_mutex);
         realsense_frames = std::vector<TimestampedFrame>(realsense_buffer.begin(), realsense_buffer.end());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(realsense_mutex);
+        logitech_frames = std::vector<LogitechFrame>(logitech_buffer.begin(), logitech_buffer.end());
     }
     
     if (active_theta_cameras > 0) {
@@ -390,10 +451,12 @@ bool MultiSensorSynchronizer::synchronization_callback() {
     TimestampedFrame* best_realsense = nullptr;
     ThetaFrame* best_theta0 = nullptr;
     ThetaFrame* best_theta1 = nullptr;
+    LogitechFrame* best_logitech = nullptr;
     
     double rs_time_diff = std::numeric_limits<double>::max();
     double theta0_time_diff = std::numeric_limits<double>::max();
     double theta1_time_diff = std::numeric_limits<double>::max();
+    double logitech_time_diff = std::numeric_limits<double>::max();
     
     // Find closest RealSense frame to the latest LiDAR frame
     for (auto& frame : realsense_frames) {
@@ -425,12 +488,22 @@ bool MultiSensorSynchronizer::synchronization_callback() {
     }
     
     // Save synchronized set if we have at least LiDAR + one other sensor
-    if (best_realsense || best_theta0 || best_theta1) {
-        save_synchronized_set(*latest_lidar, best_realsense, best_theta0, best_theta1,
-                            rs_time_diff, theta0_time_diff, theta1_time_diff);
-        
+    // Find closest Logitech frame
+    for (auto& frame : logitech_frames) {
+        if (!frame.valid) continue;
+        double diff = std::abs(latest_lidar->timestamp - frame.timestamp);
+        if (diff <= sync_window && diff < logitech_time_diff) {
+            logitech_time_diff = diff;
+            best_logitech = &frame;
+        }
+    }
+
+    if (best_realsense || best_theta0 || best_theta1 || best_logitech) {
+        save_synchronized_set(*latest_lidar, best_realsense, best_theta0, best_theta1, best_logitech,
+                            rs_time_diff, theta0_time_diff, theta1_time_diff, logitech_time_diff);
+
         // Remove ALL processed frames from buffers to prevent double-processing
-        remove_processed_frames(*latest_lidar, best_realsense, best_theta0, best_theta1);
+        remove_processed_frames(*latest_lidar, best_realsense, best_theta0, best_theta1, best_logitech);
     }
     
     return true;
@@ -491,7 +564,8 @@ void MultiSensorSynchronizer::synchronization_loop() {
 void MultiSensorSynchronizer::remove_processed_frames(const LidarFrame& lidar_frame,
                            const TimestampedFrame* realsense_frame,
                            const ThetaFrame* theta0_frame,
-                           const ThetaFrame* theta1_frame) {
+                           const ThetaFrame* theta1_frame,
+                           const LogitechFrame* logitech_frame) {
     // Remove LiDAR frame and all older frames to prevent reprocessing
     {
         std::lock_guard<std::mutex> lock(lidar_mutex);
@@ -538,13 +612,26 @@ void MultiSensorSynchronizer::remove_processed_frames(const LidarFrame& lidar_fr
             theta_buffer[1].end()
         );
     }
+
+    // Remove Logitech frames if used, and older frames
+    if (logitech_frame) {
+        std::lock_guard<std::mutex> lock(realsense_mutex);
+        logitech_buffer.erase(
+            std::remove_if(logitech_buffer.begin(), logitech_buffer.end(),
+                [logitech_frame](const LogitechFrame& frame) {
+                    return frame.timestamp <= logitech_frame->timestamp;
+                }),
+            logitech_buffer.end()
+        );
+    }
 }
 
 void MultiSensorSynchronizer::save_synchronized_set(const LidarFrame& lidar_frame,
                          const TimestampedFrame* realsense_frame,
                          const ThetaFrame* theta0_frame,
                          const ThetaFrame* theta1_frame,
-                         double rs_diff, double theta0_diff, double theta1_diff) {
+                         const LogitechFrame* logitech_frame,
+                         double rs_diff, double theta0_diff, double theta1_diff, double logitech_diff) {
     try {
         sync_count++;
         
@@ -663,19 +750,33 @@ void MultiSensorSynchronizer::save_synchronized_set(const LidarFrame& lidar_fram
             lidar_imu_csv.flush();
         }
         
+        // Save Logitech image if available
+        std::string logitech_path = "";
+        if (logitech_frame && logitech_frame->valid && !logitech_frame->image.empty()) {
+            std::string lp = base_dir + "/logitech_camera/" + prefix + "_logitech.jpg";
+            std::vector<int> compression_params;
+            compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
+            compression_params.push_back(90);
+            cv::imwrite(lp, logitech_frame->image, compression_params);
+            logitech_path = std::filesystem::path(lp).filename().string();
+        }
+
         // Write sync metadata
         sync_csv << sync_count << ","
                  << std::fixed << std::setprecision(6) << lidar_frame.timestamp << ","
                  << (realsense_frame ? std::to_string(realsense_frame->timestamp) : "") << ","
                  << (theta0_frame ? std::to_string(theta0_frame->timestamp) : "") << ","
                  << (theta1_frame ? std::to_string(theta1_frame->timestamp) : "") << ","
+                 << (logitech_frame ? std::to_string(logitech_frame->timestamp) : "") << ","
                  << std::setprecision(2) << (realsense_frame ? rs_diff * 1000 : -1) << ","
                  << (theta0_frame ? theta0_diff * 1000 : -1) << ","
                  << (theta1_frame ? theta1_diff * 1000 : -1) << ","
+                 << (logitech_frame ? logitech_diff * 1000 : -1) << ","
                  << std::filesystem::path(rs_color_path).filename().string() << ","
                  << std::filesystem::path(rs_depth_path).filename().string() << ","
                  << std::filesystem::path(theta0_path).filename().string() << ","
                  << std::filesystem::path(theta1_path).filename().string() << ","
+                 << logitech_path << ","
                  << lidar_frame.cloud_data.points.size() << ","
                  << (lidar_frame.has_imu ? "true" : "false") << "\n";
         sync_csv.flush();
@@ -726,6 +827,10 @@ void MultiSensorSynchronizer::start_recording(int duration) {
     // Start all sensor threads
     realsense_thread_handle = std::thread(&MultiSensorSynchronizer::realsense_thread, this);
     lidar_thread_handle = std::thread(&MultiSensorSynchronizer::lidar_thread, this);
+    // Start Logitech thread
+    // Try to initialize quickly; thread will retry if initialization fails
+    initialize_logitech_camera();
+    logitech_thread_handle = std::thread(&MultiSensorSynchronizer::logitech_thread, this);
     
     // Start THETA collection thread if cameras are available
     std::thread theta_thread_handle;
@@ -748,6 +853,10 @@ void MultiSensorSynchronizer::start_recording(int duration) {
     if (theta_thread_handle.joinable()) {
         theta_thread_handle.join();
     }
+    // Join Logitech thread
+    if (logitech_thread_handle.joinable()) {
+        logitech_thread_handle.join();
+    }
 }
 
 void MultiSensorSynchronizer::stop_recording() {
@@ -764,6 +873,7 @@ void MultiSensorSynchronizer::stop_recording() {
     if (sync_thread.joinable()) sync_thread.join();
     if (realsense_thread_handle.joinable()) realsense_thread_handle.join();
     if (lidar_thread_handle.joinable()) lidar_thread_handle.join();
+    if (logitech_thread_handle.joinable()) logitech_thread_handle.join();
     
     // Close files
     if (sync_csv.is_open()) sync_csv.close();
@@ -779,6 +889,7 @@ void MultiSensorSynchronizer::stop_recording() {
     std::cout << "  - theta_cam0/ (THETA X camera 0 images)" << std::endl;
     std::cout << "  - theta_cam1/ (THETA X camera 1 images)" << std::endl;
     std::cout << "  - lidar_data/ (point clouds and IMU data)" << std::endl;
+    std::cout << "  - logitech_camera/ (high-res images)" << std::endl;
 }
 
 void MultiSensorSynchronizer::set_sync_frequency(int frequency) {

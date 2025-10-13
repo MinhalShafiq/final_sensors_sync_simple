@@ -27,7 +27,8 @@ TARGET = all_sensors_sync
 SRC_DIR = src
 SOURCES = $(SRC_DIR)/main.cpp \
           $(SRC_DIR)/multi_sensor_synchronizer.cpp \
-          $(SRC_DIR)/theta_camera.cpp
+          $(SRC_DIR)/theta_camera.cpp \
+		  $(SRC_DIR)/logitech_camera.cpp
 OBJECTS = $(SOURCES:.cpp=.o)
 
 # Default target
